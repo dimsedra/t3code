@@ -5005,9 +5005,14 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
-  it.effect.each(["startTurn", "resumeThread"] as const)(
-    "preserves the workspace runtime on background work or failed reactivation via %s",
-    (activation) =>
+  it.effect.each([
+    { activation: "startTurn", rejection: "mode" },
+    { activation: "resumeThread", rejection: "mode" },
+    { activation: "startTurn", rejection: "model" },
+    { activation: "resumeThread", rejection: "model" },
+  ] as const)(
+    "preserves the workspace runtime on background work or failed $rejection reactivation via $activation",
+    ({ activation, rejection }) =>
       Effect.gen(function* () {
         const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
         const fs = yield* FileSystem.FileSystem;
@@ -5021,6 +5026,9 @@ describe("AcpAdapterV2", () => {
         const inputs: Array<AcpAdapterV2RuntimeInput> = [];
         const prompts: Array<string> = [];
         let originalClosed = false;
+        let originalRead:
+          | Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["handleReadTextFile"]>[0]
+          | undefined;
         const nativeRuntime = makeMockRuntime({ childProcessSpawner, mockAgentPath });
         const adapter = yield* makeAcpAdapterV2({
           instanceId,
@@ -5030,6 +5038,9 @@ describe("AcpAdapterV2", () => {
             capabilities: AcpProviderCapabilitiesV2,
             replaceRuntimeOnActivation: () => true,
             sessionModeForPolicy: () => "code",
+            clientFileSystem: {
+              readTextFile: (_request, cwd) => Effect.succeed({ content: cwd ?? "" }),
+            },
             enablePostSettleContinuation: true,
             registerExtensions: (context) =>
               Effect.sync(() => {
@@ -5058,13 +5069,27 @@ describe("AcpAdapterV2", () => {
                   inputs.length === 4
                     ? {
                         ...candidate,
-                        setMode: () =>
-                          Effect.fail(
-                            new EffectAcpErrors.AcpTransportError({
-                              detail: "Fixture mode configuration failure",
-                              cause: null,
-                            }),
-                          ),
+                        ...(rejection === "model"
+                          ? {
+                              setConfigOption: () =>
+                                Effect.fail(
+                                  new EffectAcpErrors.AcpRequestError({
+                                    code: -32602,
+                                    errorMessage: "Fixture model configuration failure",
+                                  }),
+                                ),
+                            }
+                          : {}),
+                        setMode:
+                          rejection === "model"
+                            ? candidate.setMode
+                            : () =>
+                                Effect.fail(
+                                  new EffectAcpErrors.AcpTransportError({
+                                    detail: "Fixture mode configuration failure",
+                                    cause: null,
+                                  }),
+                                ),
                       }
                     : inputs.length === 3
                       ? {
@@ -5082,6 +5107,10 @@ describe("AcpAdapterV2", () => {
                         }
                       : {
                           ...candidate,
+                          handleReadTextFile: (handler) => {
+                            originalRead = handler;
+                            return candidate.handleReadTextFile(handler);
+                          },
                           prompt: (request) => {
                             prompts.push(input.cwd);
                             return candidate.prompt(request);
@@ -5126,9 +5155,8 @@ describe("AcpAdapterV2", () => {
           messageText: "original workspace history",
         });
         const turn = (ordinal: number) =>
-          runtime.startTurn({
-            ...turnInput,
-            ...makeTurnInput({
+          runtime.startTurn(
+            makeTurnInput({
               threadId,
               providerThread,
               instanceId,
@@ -5137,7 +5165,7 @@ describe("AcpAdapterV2", () => {
               ordinal,
               messageText: "original workspace history",
             }),
-          });
+          );
         const completed = runtime.events.pipe(
           Stream.filter((event) => event.type === "turn.terminal"),
           Stream.runHead,
@@ -5171,8 +5199,23 @@ describe("AcpAdapterV2", () => {
         const rejected = yield* Effect.exit(resume());
         assert.isTrue(Exit.isFailure(rejected));
         if (Exit.isFailure(rejected))
-          assert.include(Cause.pretty(rejected.cause), "Fixture mode configuration failure");
+          assert.include(
+            Cause.pretty(rejected.cause),
+            `Fixture ${rejection} configuration failure`,
+          );
         assert.isFalse(originalClosed, "configuration rejection must retain the original process");
+        const retainedBeforeTurn = yield* runtime.readThreadSnapshot({ providerThread });
+        assert.deepEqual(retainedBeforeTurn.messages, unchanged.messages);
+        assert.deepEqual(retainedBeforeTurn.providerTurns, unchanged.providerTurns);
+        if (originalRead === undefined)
+          return yield* Effect.die("Expected original client file handler");
+        assert.equal(
+          (yield* originalRead(
+            { sessionId, path: "policy-probe" },
+            { requestId: "policy-probe", method: "fs/read_text_file" },
+          )).content,
+          runtimePolicy.cwd,
+        );
         yield* turn(2);
         yield* completed;
         assert.deepEqual(prompts, [runtimePolicy.cwd, runtimePolicy.cwd]);
